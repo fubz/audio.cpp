@@ -29,11 +29,16 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
     config.device = engine::io::json::optional_i32(root, "device", config.device);
     config.threads = engine::io::json::optional_i32(root, "threads", config.threads);
     config.lazy_load = engine::io::json::optional_bool(root, "lazy_load", config.lazy_load);
+    config.idle_timeout_s = engine::io::json::optional_i32(root, "idle_timeout_s", config.idle_timeout_s);
+    config.reaper_interval_s = engine::io::json::optional_i32(root, "reaper_interval_s", config.reaper_interval_s);
     if (config.port <= 0 || config.port > 65535) {
         throw std::runtime_error("server port must be in 1..65535");
     }
     if (config.threads <= 0) {
         throw std::runtime_error("server threads must be positive");
+    }
+    if (config.reaper_interval_s <= 0) {
+        throw std::runtime_error("server reaper_interval_s must be positive");
     }
 
     const auto * models = root.find("models");
@@ -48,6 +53,7 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
         model.task = engine::io::json::optional_string(item, "task", model.task);
         model.mode = engine::io::json::optional_string(item, "mode", model.mode);
         model.lazy = engine::io::json::optional_bool(item, "lazy", config.lazy_load);
+        model.idle_timeout_s = engine::io::json::optional_i32(item, "idle_timeout_s", model.idle_timeout_s);
         if (const auto * value = item.find("config")) {
             model.config_id = value->as_string();
         }

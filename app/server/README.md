@@ -49,8 +49,20 @@ The server resolves model paths from this JSON exactly as written, so use paths 
 
 Set top-level `"lazy_load": true` to register all configured model ids at startup but defer each model's framework load and session creation until its first request. A model can override the default with `"lazy": true` or `"lazy": false`.
 
-> [!WARNING]
-> Lazy loading does not unload models after a request. Once a model is first used, the server keeps that model and session in memory for reuse until the server exits.
+### Idle unload
+
+Loaded models can be released — freeing their CUDA/VRAM allocations — either on demand or automatically after an idle period. This is useful when the GPU is shared with other workloads and you want resident models to give VRAM back between bursts of requests.
+
+| Key | Scope | Default | Meaning |
+|---|---|---:|---|
+| `idle_timeout_s` | top-level | `0` | Default idle TTL (seconds) after which a loaded model is unloaded. `0` disables auto-unload. |
+| `idle_timeout_s` | per-model | inherit | Per-model override. `>= 0` sets an explicit TTL; `< 0` (or omitted) inherits the top-level default. |
+| `reaper_interval_s` | top-level | `10` | How often the background reaper scans for idle models. |
+
+The reaper thread only starts if at least one model has an effective `idle_timeout_s > 0`. Unloading is safe against in-flight requests (it takes the same per-model lock as `run`); a model reloads automatically on its next request (subject to reload latency).
+
+> [!NOTE]
+> Idle unload releases the model and its session. The first request after an unload pays the model's load cost again. Set `idle_timeout_s` above your expected inter-request gap to keep hot models warm.
 
 ## Start
 
@@ -66,7 +78,25 @@ Returns server readiness and the number of configured models.
 
 ### `GET /v1/models`
 
-Returns OpenAI-style model entries for the configured audio.cpp model ids.
+Returns OpenAI-style model entries for the configured audio.cpp model ids. Each entry also reports `"loaded"` (whether the model currently holds resources) and its effective `"idle_timeout_s"`.
+
+### `POST /v1/models/{id}/load`
+
+Eagerly loads a configured model (creates its framework session and allocates device memory) without running a task. Useful for warming a model before first use.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/models/pocket-tts/load
+# {"id":"pocket-tts","loaded":true}
+```
+
+### `POST /v1/models/{id}/unload`
+
+Releases a loaded model and its session, freeing its CUDA/VRAM allocations. Safe to call while requests are in flight (serializes on the same per-model lock); the model reloads on its next request. `unloaded` reports whether the model was resident before the call.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/models/pocket-tts/unload
+# {"id":"pocket-tts","unloaded":true,"loaded":false}
+```
 
 ### `POST /v1/audio/speech`
 

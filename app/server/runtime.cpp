@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -337,6 +340,18 @@ ServerState::ServerState(ServerConfig config, std::filesystem::path request_base
     : config_(std::move(config)),
       request_base_(std::move(request_base)) {
     load_models();
+    start_reaper();
+}
+
+ServerState::~ServerState() {
+    {
+        std::lock_guard<std::mutex> lock(reaper_mutex_);
+        reaper_stop_ = true;
+    }
+    reaper_cv_.notify_all();
+    if (reaper_thread_.joinable()) {
+        reaper_thread_.join();
+    }
 }
 
 HttpResponse ServerState::handle(const HttpRequest & request) {
@@ -355,6 +370,9 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     if (request.method == "POST" && request.path == "/v1/tasks/run") {
         return handle_generic_run(request.body);
     }
+    if (request.method == "POST" && request.path.rfind("/v1/models/", 0) == 0) {
+        return handle_model_lifecycle(request);
+    }
     return error_response(404, "unknown endpoint: " + request.path, "not_found");
 }
 
@@ -372,6 +390,9 @@ void ServerState::load_models() {
         if (!model_index_.emplace(loaded->config.id, models_.size()).second) {
             throw std::runtime_error("duplicate server model id: " + loaded->config.id);
         }
+        loaded->idle_timeout_s = loaded->config.idle_timeout_s >= 0
+            ? loaded->config.idle_timeout_s
+            : config_.idle_timeout_s;
         if (!loaded->config.lazy) {
             ensure_model_loaded_locked(*loaded);
         }
@@ -407,6 +428,21 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
     model.model = std::move(loaded_model);
     model.session = std::move(session);
     model.offline = offline;
+    model.last_used = Clock::now();
+    model.loaded.store(true, std::memory_order_relaxed);
+}
+
+void ServerState::unload_locked(LoadedModel & model) {
+    if (model.session == nullptr) {
+        return;
+    }
+    // Destruction order matters: the session owns the ggml compute graph/backend
+    // buffers, the loaded model owns the weight buffers. Both free their CUDA
+    // allocations in their destructors, returning VRAM to the device.
+    model.offline = nullptr;
+    model.session.reset();
+    model.model.reset();
+    model.loaded.store(false, std::memory_order_relaxed);
 }
 
 ServerState::LoadedModel & ServerState::require_model(const Value & body) {
@@ -431,6 +467,7 @@ ServerState::TimedTaskResult ServerState::run_model(
     const auto started = Clock::now();
     model.session->prepare(engine::runtime::build_preparation_request(request));
     auto result = model.offline->run(request);
+    model.last_used = Clock::now();
     return TimedTaskResult{std::move(result), elapsed_ms(started)};
 }
 
@@ -494,10 +531,81 @@ std::string ServerState::models_json() const {
             << ",\"family\":" << json_quote(model.config.family)
             << ",\"task\":" << json_quote(engine::runtime::to_string(model.task.task))
             << ",\"mode\":" << json_quote(engine::runtime::to_string(model.task.mode))
+            << ",\"loaded\":" << (model.loaded.load(std::memory_order_relaxed) ? "true" : "false")
+            << ",\"idle_timeout_s\":" << model.idle_timeout_s
             << "}";
     }
     out << "]}";
     return out.str();
+}
+
+HttpResponse ServerState::handle_model_lifecycle(const HttpRequest & request) {
+    // Routes: POST /v1/models/{id}/load  and  POST /v1/models/{id}/unload
+    static const std::string prefix = "/v1/models/";
+    const std::string rest = request.path.substr(prefix.size());
+    const auto slash = rest.rfind('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= rest.size()) {
+        return error_response(404, "unknown endpoint: " + request.path, "not_found");
+    }
+    const std::string id = rest.substr(0, slash);      // model ids may contain '/'
+    const std::string action = rest.substr(slash + 1);
+    const auto it = model_index_.find(id);
+    if (it == model_index_.end()) {
+        return error_response(404, "unknown model id: " + id, "not_found");
+    }
+    LoadedModel & model = *models_.at(it->second);
+
+    if (action == "unload") {
+        std::lock_guard<std::mutex> lock(model.mutex);
+        const bool was_loaded = model.session != nullptr;
+        unload_locked(model);
+        return json_response(
+            "{\"id\":" + json_quote(id) +
+            ",\"unloaded\":" + (was_loaded ? "true" : "false") +
+            ",\"loaded\":false}");
+    }
+    if (action == "load") {
+        std::lock_guard<std::mutex> lock(model.mutex);
+        ensure_model_loaded_locked(model);
+        return json_response("{\"id\":" + json_quote(id) + ",\"loaded\":true}");
+    }
+    return error_response(404, "unknown model action: " + action, "not_found");
+}
+
+void ServerState::start_reaper() {
+    const bool any_idle = std::any_of(models_.begin(), models_.end(), [](const auto & m) {
+        return m->idle_timeout_s > 0;
+    });
+    if (!any_idle) {
+        return;  // no model opts into idle unload; skip the background thread entirely
+    }
+    reaper_thread_ = std::thread([this] { reaper_loop(); });
+}
+
+void ServerState::reaper_loop() {
+    const auto interval = std::chrono::seconds(config_.reaper_interval_s);
+    std::unique_lock<std::mutex> lock(reaper_mutex_);
+    while (!reaper_stop_) {
+        reaper_cv_.wait_for(lock, interval, [this] { return reaper_stop_; });
+        if (reaper_stop_) {
+            break;
+        }
+        lock.unlock();
+        const auto now = Clock::now();
+        for (auto & entry : models_) {
+            LoadedModel & model = *entry;
+            std::lock_guard<std::mutex> model_lock(model.mutex);
+            if (model.session == nullptr || model.idle_timeout_s <= 0) {
+                continue;
+            }
+            if (now - model.last_used >= std::chrono::seconds(model.idle_timeout_s)) {
+                unload_locked(model);
+                std::cout << "audiocpp_server: idle-unloaded model \"" << model.config.id
+                          << "\" after " << model.idle_timeout_s << "s\n";
+            }
+        }
+        lock.lock();
+    }
 }
 
 }  // namespace minitts::server
