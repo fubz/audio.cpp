@@ -42,7 +42,11 @@ void print_help() {
         << "  POST /v1/audio/transcriptions\n"
         << "  POST /v1/tasks/run\n"
         << "  POST /v1/models/<id>/load\n"
-        << "  POST /v1/models/<id>/unload\n";
+        << "  POST /v1/models/<id>/unload\n"
+        << "  GET  /v1/voices\n"
+        << "  POST /v1/voices\n"
+        << "  GET  /v1/voices/<name>\n"
+        << "  DELETE /v1/voices/<name>\n";
 }
 
 }  // namespace

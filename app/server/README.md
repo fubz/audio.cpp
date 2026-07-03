@@ -117,6 +117,38 @@ curl http://127.0.0.1:8080/v1/audio/speech \
 
 Set `"response_format": "json"` to receive base64 WAV in a JSON response.
 
+If `"voice"` names a **registered voice** (see below) it supplies the reference
+sample/transcript (clone) or instruction (design), and the voice's stored `model`
+is used when the request omits `"model"`. An unregistered `"voice"` string is
+passed through to the model's native handling (e.g. Qwen3 CustomVoice speakers).
+
+### Voice registry — `/v1/voices`
+
+Stores named voices on disk (`<request-dir>/voices/<name>/`) so a voice can be
+created once and reused by id. A **clone** voice carries a reference sample (+ its
+transcript); a **design** voice carries a text instruction. Names must match
+`[A-Za-z0-9_-]` (1–64 chars).
+
+```bash
+# create a clone voice from a sample (inline base64, or "sample_path": server-local)
+curl -X POST http://127.0.0.1:8080/v1/voices -H 'Content-Type: application/json' -d '{
+  "name": "narrator", "model": "qwen3-tts",
+  "sample_b64": "<base64 wav>", "reference_text": "transcript of the sample"
+}'
+# create a design voice from a description
+curl -X POST http://127.0.0.1:8080/v1/voices -d '{
+  "name": "calm_host", "model": "qwen3-voicedesign", "instruct": "A calm, warm adult narrator"
+}'
+
+curl http://127.0.0.1:8080/v1/voices              # list
+curl http://127.0.0.1:8080/v1/voices/narrator      # one voice
+curl -X DELETE http://127.0.0.1:8080/v1/voices/narrator
+
+# then synthesize by id — no need to resend the sample or pick the model:
+curl http://127.0.0.1:8080/v1/audio/speech -o out.wav \
+  -d '{"input": "Reused voice.", "voice": "narrator"}'
+```
+
 ### `POST /v1/audio/transcriptions`
 
 JSON transcription request using a server-local audio path.

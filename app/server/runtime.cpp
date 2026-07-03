@@ -6,11 +6,14 @@
 #include "engine/framework/runtime/registry.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -113,6 +116,45 @@ std::string base64_encode(const uint8_t * data, size_t size) {
 
 std::string base64_encode(const std::vector<uint8_t> & bytes) {
     return base64_encode(bytes.data(), bytes.size());
+}
+
+std::vector<uint8_t> base64_decode(const std::string & in) {
+    auto sextet = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;  // skip whitespace / newlines / other
+    };
+    std::vector<uint8_t> out;
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        const int v = sextet(c);
+        if (v < 0) continue;
+        buffer = (buffer << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buffer >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Voice names become on-disk directory names — keep them filesystem-safe.
+bool is_valid_voice_name(const std::string & name) {
+    if (name.empty() || name.size() > 64) {
+        return false;
+    }
+    for (const char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '-' && c != '_') {
+            return false;
+        }
+    }
+    return true;
 }
 
 double elapsed_ms(Clock::time_point started) {
@@ -338,7 +380,8 @@ engine::runtime::TaskRequest build_openai_transcription_request(const Value & bo
 
 ServerState::ServerState(ServerConfig config, std::filesystem::path request_base)
     : config_(std::move(config)),
-      request_base_(std::move(request_base)) {
+      request_base_(std::move(request_base)),
+      voices_dir_(request_base_ / "voices") {
     load_models();
     start_reaper();
 }
@@ -372,6 +415,9 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     }
     if (request.method == "POST" && request.path.rfind("/v1/models/", 0) == 0) {
         return handle_model_lifecycle(request);
+    }
+    if (request.path == "/v1/voices" || request.path.rfind("/v1/voices/", 0) == 0) {
+        return handle_voices(request);
     }
     return error_response(404, "unknown endpoint: " + request.path, "not_found");
 }
@@ -445,13 +491,16 @@ void ServerState::unload_locked(LoadedModel & model) {
     model.loaded.store(false, std::memory_order_relaxed);
 }
 
-ServerState::LoadedModel & ServerState::require_model(const Value & body) {
-    const std::string id = engine::io::json::require_string(body, "model");
+ServerState::LoadedModel & ServerState::require_model_by_id(const std::string & id) {
     const auto it = model_index_.find(id);
     if (it == model_index_.end()) {
         throw std::runtime_error("unknown model id: " + id);
     }
     return *models_.at(it->second);
+}
+
+ServerState::LoadedModel & ServerState::require_model(const Value & body) {
+    return require_model_by_id(engine::io::json::require_string(body, "model"));
 }
 
 struct ServerState::TimedTaskResult {
@@ -473,8 +522,41 @@ ServerState::TimedTaskResult ServerState::run_model(
 
 HttpResponse ServerState::handle_speech(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
-    auto & model = require_model(body);
-    const auto request = build_openai_speech_request(body, request_base_);
+
+    // If "voice" names a registered voice, it carries its own definition (and
+    // possibly its own model). Otherwise "voice" falls through to the model's
+    // native cached-voice handling (e.g. Qwen3 CustomVoice packaged speakers).
+    std::optional<VoiceManifest> voice;
+    if (const auto * value = body.find("voice"); value != nullptr && value->is_string()) {
+        voice = lookup_voice(value->as_string());
+    }
+    std::string model_id;
+    if (const auto * value = body.find("model"); value != nullptr && value->is_string()) {
+        model_id = value->as_string();
+    } else if (voice.has_value() && !voice->model.empty()) {
+        model_id = voice->model;
+    } else {
+        throw std::runtime_error(
+            "speech request requires \"model\" (or a registered \"voice\" that carries one)");
+    }
+    auto & model = require_model_by_id(model_id);
+
+    auto request = build_openai_speech_request(body, request_base_);
+    if (voice.has_value()) {
+        if (voice->mode == "clone") {
+            engine::runtime::VoiceReference reference;
+            reference.audio = minitts::cli::read_audio_buffer(voice->ref_wav);
+            engine::runtime::VoiceCondition condition;
+            condition.speaker = std::move(reference);
+            request.voice = std::move(condition);
+            if (!voice->reference_text.empty()) {
+                request.options["reference_text"] = voice->reference_text;
+            }
+        } else if (voice->mode == "design") {
+            request.voice.reset();  // designed voices carry no speaker reference
+            request.options["instruct"] = voice->instruct;
+        }
+    }
     const auto timed_result = run_model(model, request);
     const auto & audio = select_audio_output(timed_result.result);
     const auto wav = encode_pcm16_wav(audio);
@@ -606,6 +688,162 @@ void ServerState::reaper_loop() {
         }
         lock.lock();
     }
+}
+
+std::string ServerState::voice_to_json(const VoiceManifest & voice) const {
+    std::ostringstream out;
+    out << "{\"name\":" << json_quote(voice.name)
+        << ",\"mode\":" << json_quote(voice.mode)
+        << ",\"model\":" << json_quote(voice.model)
+        << ",\"reference_text\":" << json_quote(voice.reference_text)
+        << ",\"instruct\":" << json_quote(voice.instruct)
+        << "}";
+    return out.str();
+}
+
+std::optional<ServerState::VoiceManifest> ServerState::lookup_voice(const std::string & name) const {
+    if (!is_valid_voice_name(name)) {
+        return std::nullopt;
+    }
+    const auto manifest_path = voices_dir_ / name / "voice.json";
+    std::error_code ec;
+    if (!std::filesystem::exists(manifest_path, ec)) {
+        return std::nullopt;
+    }
+    const auto root = engine::io::json::parse_file(manifest_path);
+    VoiceManifest voice;
+    voice.name = name;
+    voice.mode = engine::io::json::optional_string(root, "mode", "clone");
+    voice.model = engine::io::json::optional_string(root, "model", "");
+    voice.reference_text = engine::io::json::optional_string(root, "reference_text", "");
+    voice.instruct = engine::io::json::optional_string(root, "instruct", "");
+    voice.ref_wav = voices_dir_ / name / "ref.wav";
+    return voice;
+}
+
+HttpResponse ServerState::handle_voices(const HttpRequest & request) {
+    if (request.path == "/v1/voices") {
+        if (request.method == "GET") {
+            return list_voices();
+        }
+        if (request.method == "POST") {
+            return create_voice(request.body);
+        }
+        return error_response(405, "method not allowed: " + request.method, "method_not_allowed");
+    }
+    const std::string prefix = "/v1/voices/";
+    const std::string name = request.path.substr(prefix.size());
+    if (!is_valid_voice_name(name)) {
+        return error_response(404, "unknown endpoint: " + request.path, "not_found");
+    }
+    if (request.method == "GET") {
+        const auto voice = lookup_voice(name);
+        if (!voice.has_value()) {
+            return error_response(404, "unknown voice: " + name, "not_found");
+        }
+        return json_response(voice_to_json(*voice));
+    }
+    if (request.method == "DELETE") {
+        return delete_voice(name);
+    }
+    return error_response(405, "method not allowed: " + request.method, "method_not_allowed");
+}
+
+HttpResponse ServerState::create_voice(const std::string & body_text) {
+    const auto body = engine::io::json::parse(body_text);
+    const std::string name = engine::io::json::require_string(body, "name");
+    if (!is_valid_voice_name(name)) {
+        return error_response(400, "voice name must match [A-Za-z0-9_-] and be 1..64 chars", "invalid_request");
+    }
+
+    VoiceManifest voice;
+    voice.name = name;
+    voice.model = engine::io::json::optional_string(body, "model", "");
+    voice.reference_text = engine::io::json::optional_string(body, "reference_text", "");
+    voice.instruct = engine::io::json::optional_string(body, "instruct", "");
+
+    // Sample source for a clone voice: inline base64 or a server-local path.
+    std::vector<uint8_t> sample;
+    bool has_sample = false;
+    if (const auto * value = body.find("sample_b64"); value != nullptr && value->is_string()) {
+        sample = base64_decode(value->as_string());
+        has_sample = true;
+    } else if (const auto * value = body.find("sample_path"); value != nullptr && value->is_string()) {
+        const auto path = resolve_path(request_base_, value->as_string());
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return error_response(400, "cannot read sample_path: " + path.string(), "invalid_request");
+        }
+        sample.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        has_sample = true;
+    }
+
+    if (has_sample) {
+        voice.mode = "clone";
+    } else if (!voice.instruct.empty()) {
+        voice.mode = "design";
+    } else {
+        return error_response(
+            400, "voice requires sample_b64/sample_path (clone) or instruct (design)", "invalid_request");
+    }
+
+    const auto dir = voices_dir_ / name;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        return error_response(500, "failed to create voice directory: " + ec.message(), "server_error");
+    }
+    if (voice.mode == "clone") {
+        std::ofstream out(dir / "ref.wav", std::ios::binary);
+        out.write(reinterpret_cast<const char *>(sample.data()), static_cast<std::streamsize>(sample.size()));
+        if (!out) {
+            return error_response(500, "failed to write voice sample", "server_error");
+        }
+        voice.ref_wav = dir / "ref.wav";
+    }
+    std::ofstream manifest(dir / "voice.json");
+    manifest << voice_to_json(voice);
+    if (!manifest) {
+        return error_response(500, "failed to write voice manifest", "server_error");
+    }
+    return json_response(voice_to_json(voice), 201);
+}
+
+HttpResponse ServerState::list_voices() const {
+    std::ostringstream out;
+    out << "{\"object\":\"list\",\"data\":[";
+    std::error_code ec;
+    bool first = true;
+    if (std::filesystem::exists(voices_dir_, ec)) {
+        for (const auto & entry : std::filesystem::directory_iterator(voices_dir_, ec)) {
+            if (!entry.is_directory(ec)) {
+                continue;
+            }
+            const auto voice = lookup_voice(entry.path().filename().string());
+            if (!voice.has_value()) {
+                continue;
+            }
+            if (!first) {
+                out << ",";
+            }
+            first = false;
+            out << voice_to_json(*voice);
+        }
+    }
+    out << "]}";
+    return json_response(out.str());
+}
+
+HttpResponse ServerState::delete_voice(const std::string & name) {
+    const auto dir = voices_dir_ / name;
+    std::error_code ec;
+    const bool existed = std::filesystem::exists(dir, ec);
+    std::filesystem::remove_all(dir, ec);
+    if (ec) {
+        return error_response(500, "failed to delete voice: " + ec.message(), "server_error");
+    }
+    return json_response(
+        "{\"name\":" + json_quote(name) + ",\"deleted\":" + (existed ? "true" : "false") + "}");
 }
 
 }  // namespace minitts::server

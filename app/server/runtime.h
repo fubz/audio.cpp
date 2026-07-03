@@ -39,10 +39,23 @@ private:
         std::atomic<bool> loaded{false};                     // lock-free status readout
     };
 
+    // A named, server-stored voice. "clone" carries a reference sample (+ its
+    // transcript); "design" carries a text instruction. `model` is the server
+    // model id this voice synthesizes against (may be empty → caller supplies).
+    struct VoiceManifest {
+        std::string name;
+        std::string mode;            // "clone" | "design"
+        std::string model;
+        std::string reference_text;  // clone
+        std::string instruct;        // design
+        std::filesystem::path ref_wav;
+    };
+
     void load_models();
     void ensure_model_loaded_locked(LoadedModel & model);
     void unload_locked(LoadedModel & model);  // caller holds model.mutex
     LoadedModel & require_model(const engine::io::json::Value & body);
+    LoadedModel & require_model_by_id(const std::string & id);
     struct TimedTaskResult;
     TimedTaskResult run_model(LoadedModel & model, const engine::runtime::TaskRequest & request);
     HttpResponse handle_speech(const std::string & body_text);
@@ -51,11 +64,20 @@ private:
     HttpResponse handle_model_lifecycle(const HttpRequest & request);
     std::string models_json() const;
 
+    // Voice registry (POST/GET/DELETE /v1/voices[/{name}]).
+    HttpResponse handle_voices(const HttpRequest & request);
+    HttpResponse create_voice(const std::string & body_text);
+    HttpResponse list_voices() const;
+    HttpResponse delete_voice(const std::string & name);
+    std::optional<VoiceManifest> lookup_voice(const std::string & name) const;
+    std::string voice_to_json(const VoiceManifest & voice) const;
+
     void start_reaper();
     void reaper_loop();
 
     ServerConfig config_;
     std::filesystem::path request_base_;
+    std::filesystem::path voices_dir_;
     std::vector<std::unique_ptr<LoadedModel>> models_;
     std::unordered_map<std::string, size_t> model_index_;
 
