@@ -356,19 +356,37 @@ engine::runtime::TaskRequest build_openai_speech_request(const Value & body, con
 }
 
 engine::runtime::TaskRequest build_openai_transcription_request(const Value & body, const std::filesystem::path & base_dir) {
-    const auto * audio = body.find("audio");
-    if (audio == nullptr) {
-        audio = body.find("audio_path");
-    }
-    if (audio == nullptr) {
-        audio = body.find("file");
-    }
-    if (audio == nullptr || !audio->is_string()) {
-        throw std::runtime_error("transcription request requires audio, audio_path, or file path");
+    engine::runtime::TaskRequest request;
+
+    // Inline audio (base64 WAV) — for callers that can't drop a server-local file
+    // (e.g. a remote client / another container). Decoded to a temp file so the
+    // existing WAV reader can consume it.
+    if (const auto * b64 = body.find("audio_b64"); b64 != nullptr && b64->is_string()) {
+        static std::atomic<uint64_t> counter{0};
+        const auto bytes = base64_decode(b64->as_string());
+        const auto tmp = std::filesystem::temp_directory_path() /
+            ("audiocpp-stt-" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) + ".wav");
+        {
+            std::ofstream out(tmp, std::ios::binary);
+            out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        }
+        request.audio_input = minitts::cli::read_audio_buffer(tmp);
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+    } else {
+        const auto * audio = body.find("audio");
+        if (audio == nullptr) {
+            audio = body.find("audio_path");
+        }
+        if (audio == nullptr) {
+            audio = body.find("file");
+        }
+        if (audio == nullptr || !audio->is_string()) {
+            throw std::runtime_error("transcription request requires audio_b64, audio, audio_path, or file");
+        }
+        request.audio_input = minitts::cli::read_audio_buffer(resolve_path(base_dir, audio->as_string()));
     }
 
-    engine::runtime::TaskRequest request;
-    request.audio_input = minitts::cli::read_audio_buffer(resolve_path(base_dir, audio->as_string()));
     request.options = options_from_object(body.find("options"));
     if (const auto * value = body.find("language")) {
         request.options["language"] = value->as_string();

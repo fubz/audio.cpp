@@ -151,15 +151,20 @@ curl http://127.0.0.1:8080/v1/audio/speech -o out.wav \
 
 ### `POST /v1/audio/transcriptions`
 
-JSON transcription request using a server-local audio path.
+JSON transcription request. Provide the audio as a **server-local path** (`audio` /
+`audio_path` / `file`) or **inline** as base64 (`audio_b64`) for callers that can't
+drop a file the server can read (a remote client or another container).
 
 ```bash
+# server-local path:
 curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3-asr",
-    "audio": "/path/to/input.wav"
-  }'
+  -d '{"model": "qwen3-asr", "audio": "/path/to/input.wav"}'
+
+# inline base64 (WAV bytes):
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3-asr", "audio_b64": "<base64 wav>"}'
 ```
 
 ### `POST /v1/tasks/run`
