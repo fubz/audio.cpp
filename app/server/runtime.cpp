@@ -11,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -26,6 +27,10 @@ namespace {
 using engine::io::json::Value;
 
 using Clock = std::chrono::steady_clock;
+
+std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
 
 std::string json_quote(std::string_view value) {
     return engine::io::json::stringify_string(value);
@@ -400,6 +405,7 @@ ServerState::ServerState(ServerConfig config, std::filesystem::path request_base
     : config_(std::move(config)),
       request_base_(std::move(request_base)),
       voices_dir_(request_base_ / "voices") {
+    last_inference_ms_.store(now_ms(), std::memory_order_relaxed);
     load_models();
     start_reaper();
 }
@@ -494,6 +500,8 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
     model.offline = offline;
     model.last_used = Clock::now();
     model.loaded.store(true, std::memory_order_relaxed);
+    ever_loaded_.store(true, std::memory_order_relaxed);
+    last_inference_ms_.store(now_ms(), std::memory_order_relaxed);
 }
 
 void ServerState::unload_locked(LoadedModel & model) {
@@ -535,6 +543,7 @@ ServerState::TimedTaskResult ServerState::run_model(
     model.session->prepare(engine::runtime::build_preparation_request(request));
     auto result = model.offline->run(request);
     model.last_used = Clock::now();
+    last_inference_ms_.store(now_ms(), std::memory_order_relaxed);
     return TimedTaskResult{std::move(result), elapsed_ms(started)};
 }
 
@@ -676,8 +685,8 @@ void ServerState::start_reaper() {
     const bool any_idle = std::any_of(models_.begin(), models_.end(), [](const auto & m) {
         return m->idle_timeout_s > 0;
     });
-    if (!any_idle) {
-        return;  // no model opts into idle unload; skip the background thread entirely
+    if (!any_idle && config_.idle_exit_after_s <= 0) {
+        return;  // nothing opts into idle unload or idle exit; skip the background thread
     }
     reaper_thread_ = std::thread([this] { reaper_loop(); });
 }
@@ -702,6 +711,20 @@ void ServerState::reaper_loop() {
                 unload_locked(model);
                 std::cout << "audiocpp_server: idle-unloaded model \"" << model.config.id
                           << "\" after " << model.idle_timeout_s << "s\n";
+            }
+        }
+        // Idle-exit: once every model has unloaded and the server has been idle past the
+        // grace period, exit so the CUDA primary context is released (ggml can't hot-release
+        // it — only process exit does). The restart policy brings us back cold at ~P8 idle.
+        if (config_.idle_exit_after_s > 0 && ever_loaded_.load(std::memory_order_relaxed)) {
+            const bool any_loaded = std::any_of(models_.begin(), models_.end(),
+                [](const auto & m) { return m->loaded.load(std::memory_order_relaxed); });
+            const std::int64_t idle_ms = now_ms() - last_inference_ms_.load(std::memory_order_relaxed);
+            if (!any_loaded && idle_ms >= static_cast<std::int64_t>(config_.idle_exit_after_s) * 1000) {
+                std::cout << "audiocpp_server: idle " << (idle_ms / 1000)
+                          << "s with no models loaded — exiting to release the GPU"
+                             " (restart policy brings it back cold)." << std::endl;
+                std::_Exit(0);
             }
         }
         lock.lock();

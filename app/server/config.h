@@ -30,6 +30,11 @@ struct ServerConfig {
     bool lazy_load = false;
     int idle_timeout_s = 0;    // default per-model idle unload (seconds); 0 = never unload
     int reaper_interval_s = 10;  // how often the idle reaper scans loaded models
+    int idle_exit_after_s = 0;   // >0: once all models have unloaded and the server has been
+                                 // idle this long, exit(0) to fully release the CUDA context (the
+                                 // GPU only drops to its low-power state on process exit — ggml
+                                 // holds the primary context process-wide). Requires a container
+                                 // restart policy + idle_timeout_s > 0; set it above idle_timeout_s.
     std::vector<ServerModelConfig> models;
 };
 

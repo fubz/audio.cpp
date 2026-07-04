@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -85,6 +86,10 @@ private:
     std::mutex reaper_mutex_;
     std::condition_variable reaper_cv_;
     bool reaper_stop_ = false;
+
+    // Idle-exit bookkeeping (see ServerConfig::idle_exit_after_s).
+    std::atomic<std::int64_t> last_inference_ms_{0};  // steady_clock epoch ms of last load/run
+    std::atomic<bool> ever_loaded_{false};            // a model was loaded at least once this process
 };
 
 }  // namespace minitts::server

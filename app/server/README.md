@@ -58,11 +58,18 @@ Loaded models can be released — freeing their CUDA/VRAM allocations — either
 | `idle_timeout_s` | top-level | `0` | Default idle TTL (seconds) after which a loaded model is unloaded. `0` disables auto-unload. |
 | `idle_timeout_s` | per-model | inherit | Per-model override. `>= 0` sets an explicit TTL; `< 0` (or omitted) inherits the top-level default. |
 | `reaper_interval_s` | top-level | `10` | How often the background reaper scans for idle models. |
+| `idle_exit_after_s` | top-level | `0` | `>0`: once **all** models have unloaded and the server has stayed idle this long, the process `exit(0)`s to fully release the GPU. Requires a container restart policy; set it **above** `idle_timeout_s`. `0` disables. |
 
-The reaper thread only starts if at least one model has an effective `idle_timeout_s > 0`. Unloading is safe against in-flight requests (it takes the same per-model lock as `run`); a model reloads automatically on its next request (subject to reload latency).
+The reaper thread starts if at least one model has an effective `idle_timeout_s > 0` **or** `idle_exit_after_s > 0`. Unloading is safe against in-flight requests (it takes the same per-model lock as `run`); a model reloads automatically on its next request (subject to reload latency).
+
+### Idle exit (fully releasing the GPU)
+
+Unloading a model frees its weights/VRAM, but the **CUDA primary context** (~100–200 MiB of driver state + compiled kernels) stays resident for the life of the process — ggml initializes it via one-shot process-lifetime statics, so it cannot be safely torn down and re-created in-process. While that context exists the GPU is held out of its lowest power state (e.g. an A2 sits at P0/~20 W instead of P8/~6 W).
+
+`idle_exit_after_s` closes that gap the only safe way: when the server has fully drained (every model unloaded) and stayed idle past the grace period, it `exit(0)`s. Under a restart policy (`restart: unless-stopped`, Kubernetes, systemd, …) the process comes back **cold** — no context, GPU at idle — and re-initializes on the next request. It's scale-to-zero for the GPU. The exit only fires after a model was loaded at least once, ignores `/health` probes, and won't loop on a never-used server.
 
 > [!NOTE]
-> Idle unload releases the model and its session. The first request after an unload pays the model's load cost again. Set `idle_timeout_s` above your expected inter-request gap to keep hot models warm.
+> Idle unload releases the model and its session. The first request after an unload pays the model's load cost again; the first request after an idle-exit also pays process startup. Set `idle_timeout_s` above your expected inter-request gap to keep hot models warm, and `idle_exit_after_s` well above `idle_timeout_s` so the GPU is only released when genuinely idle.
 
 ## Start
 

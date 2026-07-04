@@ -31,6 +31,7 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
     config.lazy_load = engine::io::json::optional_bool(root, "lazy_load", config.lazy_load);
     config.idle_timeout_s = engine::io::json::optional_i32(root, "idle_timeout_s", config.idle_timeout_s);
     config.reaper_interval_s = engine::io::json::optional_i32(root, "reaper_interval_s", config.reaper_interval_s);
+    config.idle_exit_after_s = engine::io::json::optional_i32(root, "idle_exit_after_s", config.idle_exit_after_s);
     if (config.port <= 0 || config.port > 65535) {
         throw std::runtime_error("server port must be in 1..65535");
     }
