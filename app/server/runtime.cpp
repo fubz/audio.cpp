@@ -474,6 +474,9 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
     if (model.session != nullptr) {
         return;
     }
+    // Make room first: on a small/shared GPU two large models can't co-reside, so
+    // free the least-recently-used resident model(s) before this cudaMalloc runs.
+    evict_for_load_locked(model);
     auto registry = engine::runtime::make_default_registry();
 
     engine::runtime::ModelLoadRequest load_request;
@@ -499,9 +502,51 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
     model.session = std::move(session);
     model.offline = offline;
     model.last_used = Clock::now();
+    model.last_used_ms_.store(now_ms(), std::memory_order_relaxed);
     model.loaded.store(true, std::memory_order_relaxed);
     ever_loaded_.store(true, std::memory_order_relaxed);
     last_inference_ms_.store(now_ms(), std::memory_order_relaxed);
+}
+
+void ServerState::evict_for_load_locked(LoadedModel & loading) {
+    if (config_.max_resident_models <= 0) {
+        return;  // unlimited residency (default) — nothing to enforce
+    }
+    std::lock_guard<std::mutex> guard(residency_mutex_);
+
+    // Currently-resident models other than the one we're about to load.
+    std::vector<LoadedModel *> resident;
+    for (auto & entry : models_) {
+        if (entry.get() != &loading && entry->loaded.load(std::memory_order_relaxed)) {
+            resident.push_back(entry.get());
+        }
+    }
+    // Evict enough to leave a free slot for `loading` (which is not yet resident).
+    int to_evict = static_cast<int>(resident.size()) - config_.max_resident_models + 1;
+    if (to_evict <= 0) {
+        return;
+    }
+    // Least-recently-used first (lock-free read of the LRU mirror).
+    std::sort(resident.begin(), resident.end(), [](const LoadedModel * a, const LoadedModel * b) {
+        return a->last_used_ms_.load(std::memory_order_relaxed) <
+               b->last_used_ms_.load(std::memory_order_relaxed);
+    });
+    for (LoadedModel * victim : resident) {
+        if (to_evict <= 0) {
+            break;
+        }
+        // try_lock, never block: a model with an in-flight request holds its mutex and
+        // can't be evicted (and blocking here could deadlock against another loader).
+        std::unique_lock<std::mutex> victim_lock(victim->mutex, std::try_to_lock);
+        if (!victim_lock.owns_lock() || victim->session == nullptr) {
+            continue;  // busy, or already unloaded since we snapshotted
+        }
+        unload_locked(*victim);
+        std::cout << "audiocpp_server: evicted model \"" << victim->config.id
+                  << "\" to load \"" << loading.config.id
+                  << "\" (max_resident_models=" << config_.max_resident_models << ")\n";
+        --to_evict;
+    }
 }
 
 void ServerState::unload_locked(LoadedModel & model) {
@@ -543,6 +588,7 @@ ServerState::TimedTaskResult ServerState::run_model(
     model.session->prepare(engine::runtime::build_preparation_request(request));
     auto result = model.offline->run(request);
     model.last_used = Clock::now();
+    model.last_used_ms_.store(now_ms(), std::memory_order_relaxed);
     last_inference_ms_.store(now_ms(), std::memory_order_relaxed);
     return TimedTaskResult{std::move(result), elapsed_ms(started)};
 }

@@ -35,6 +35,12 @@ struct ServerConfig {
                                  // GPU only drops to its low-power state on process exit — ggml
                                  // holds the primary context process-wide). Requires a container
                                  // restart policy + idle_timeout_s > 0; set it above idle_timeout_s.
+    int max_resident_models = 0;  // >0: cap how many models stay loaded (in VRAM) at once. Before
+                                  // loading a model the least-recently-used resident model(s) are
+                                  // unloaded to honor the cap; a model with an in-flight request is
+                                  // never evicted. 0 = unlimited (default). Set to 1 on a small or
+                                  // shared GPU where two large models can't co-reside — turns a
+                                  // cudaMalloc OOM-on-load into a clean swap.
     std::vector<ServerModelConfig> models;
 };
 

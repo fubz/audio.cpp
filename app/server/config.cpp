@@ -32,6 +32,7 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
     config.idle_timeout_s = engine::io::json::optional_i32(root, "idle_timeout_s", config.idle_timeout_s);
     config.reaper_interval_s = engine::io::json::optional_i32(root, "reaper_interval_s", config.reaper_interval_s);
     config.idle_exit_after_s = engine::io::json::optional_i32(root, "idle_exit_after_s", config.idle_exit_after_s);
+    config.max_resident_models = engine::io::json::optional_i32(root, "max_resident_models", config.max_resident_models);
     if (config.port <= 0 || config.port > 65535) {
         throw std::runtime_error("server port must be in 1..65535");
     }
@@ -40,6 +41,9 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
     }
     if (config.reaper_interval_s <= 0) {
         throw std::runtime_error("server reaper_interval_s must be positive");
+    }
+    if (config.max_resident_models < 0) {
+        throw std::runtime_error("server max_resident_models must be >= 0");
     }
 
     const auto * models = root.find("models");

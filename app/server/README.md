@@ -59,8 +59,15 @@ Loaded models can be released — freeing their CUDA/VRAM allocations — either
 | `idle_timeout_s` | per-model | inherit | Per-model override. `>= 0` sets an explicit TTL; `< 0` (or omitted) inherits the top-level default. |
 | `reaper_interval_s` | top-level | `10` | How often the background reaper scans for idle models. |
 | `idle_exit_after_s` | top-level | `0` | `>0`: once **all** models have unloaded and the server has stayed idle this long, the process `exit(0)`s to fully release the GPU. Requires a container restart policy; set it **above** `idle_timeout_s`. `0` disables. |
+| `max_resident_models` | top-level | `0` | `>0`: cap how many models stay loaded (in VRAM) at once. Before a load, the least-recently-used resident model(s) are evicted to honor the cap. `0` = unlimited. See [Resident-model cap](#resident-model-cap-evict-on-load). |
 
 The reaper thread starts if at least one model has an effective `idle_timeout_s > 0` **or** `idle_exit_after_s > 0`. Unloading is safe against in-flight requests (it takes the same per-model lock as `run`); a model reloads automatically on its next request (subject to reload latency).
+
+### Resident-model cap (evict-on-load)
+
+Idle unload is *time*-based; `max_resident_models` bounds *space*. When several models are configured but the GPU can't hold them all at once (a small or shared card — e.g. two 1.7B TTS models won't co-reside on a 16 GB A2 that also runs NVENC), a load of model B while A is still resident fails with `cudaMalloc failed: out of memory`.
+
+With `max_resident_models: N`, each load first frees the least-recently-used resident model(s) so at most `N` stay loaded — turning that OOM into a clean swap. Set `N: 1` to keep exactly one model on the card. Eviction is best-effort and safe: a model with an **in-flight request is never evicted** (its lock is taken with `try_lock`, so a genuinely busy model is skipped rather than blocked on), and concurrent loads are serialized so they can't both claim the last slot. The evicted model reloads automatically on its next request (paying its load cost again), so pair a low `N` with `idle_timeout_s` tuned to your traffic.
 
 ### Idle exit (fully releasing the GPU)
 

@@ -38,6 +38,7 @@ private:
         std::chrono::steady_clock::time_point last_used{};  // guarded by mutex
         int idle_timeout_s = 0;                              // effective (resolved) idle TTL
         std::atomic<bool> loaded{false};                     // lock-free status readout
+        std::atomic<std::int64_t> last_used_ms_{0};          // lock-free mirror of last_used (LRU eviction)
     };
 
     // A named, server-stored voice. "clone" carries a reference sample (+ its
@@ -55,6 +56,7 @@ private:
     void load_models();
     void ensure_model_loaded_locked(LoadedModel & model);
     void unload_locked(LoadedModel & model);  // caller holds model.mutex
+    void evict_for_load_locked(LoadedModel & loading);  // honor max_resident_models; caller holds loading.mutex
     LoadedModel & require_model(const engine::io::json::Value & body);
     LoadedModel & require_model_by_id(const std::string & id);
     struct TimedTaskResult;
@@ -86,6 +88,11 @@ private:
     std::mutex reaper_mutex_;
     std::condition_variable reaper_cv_;
     bool reaper_stop_ = false;
+
+    // Serializes residency accounting (evict-on-load) so two concurrent loads can't
+    // both decide there's room. Victims are taken with try_lock (never blocks on an
+    // in-flight model), so this never participates in a lock cycle. See max_resident_models.
+    std::mutex residency_mutex_;
 
     // Idle-exit bookkeeping (see ServerConfig::idle_exit_after_s).
     std::atomic<std::int64_t> last_inference_ms_{0};  // steady_clock epoch ms of last load/run
